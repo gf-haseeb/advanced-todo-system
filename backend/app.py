@@ -3,6 +3,11 @@
 from flask import Flask, jsonify, request
 from flask_cors import CORS
 from my_todo_lib.manager import TaskManager
+from my_todo_lib.core.task import Task
+from my_todo_lib.core.constants import (
+    TaskStatus,
+    Priority,
+)
 from backend.config import (
     DEBUG,
     HOST,
@@ -49,8 +54,13 @@ def get_all_tasks() -> tuple:
         tuple: JSON response with list of tasks and HTTP status code.
     """
     try:
-        tasks = manager.get_all_tasks_across_lists()
-        tasks_data = [task.to_dict() for task in tasks]
+        all_tasks = []
+        for task_list in manager.get_lists():
+            tasks = manager.get_tasks(task_list.id)
+            all_tasks.extend(tasks)
+        
+        tasks_data = [{'id': t.id, 'title': t.title, 'status': t.status, 
+                       'priority': t.priority} for t in all_tasks]
         return jsonify({
             'success': True,
             'data': tasks_data,
@@ -75,17 +85,20 @@ def get_task(task_id: int) -> tuple:
         tuple: JSON response with task data and HTTP status code.
     """
     try:
-        task = manager.get_task(task_id)
-        if not task:
-            return jsonify({
-                'success': False,
-                'error': f'Task {task_id} not found'
-            }), 404
-
+        # Search across all lists
+        for task_list in manager.get_lists():
+            task = manager.get_task(task_list.id, task_id)
+            if task:
+                return jsonify({
+                    'success': True,
+                    'data': {'id': task.id, 'title': task.title, 
+                            'status': task.status, 'priority': task.priority}
+                }), 200
+        
         return jsonify({
-            'success': True,
-            'data': task.to_dict()
-        }), 200
+            'success': False,
+            'error': f'Task {task_id} not found'
+        }), 404
 
     except KeyError as e:
         return jsonify({
@@ -136,17 +149,18 @@ def create_task() -> tuple:
                 'error': 'Missing required field: title'
             }), 400
 
-        task = manager.create_task(
-            list_id=data['list_id'],
+        task = Task(
             title=data['title'],
-            description=data.get('description', ''),
-            priority=data.get('priority', 'medium'),
+            description=data.get('description', '')
         )
+        manager.add_task_to_list(data['list_id'], task)
+        manager.save()
 
         return jsonify({
             'success': True,
             'message': 'Task created successfully',
-            'data': task.to_dict()
+            'data': {'id': task.id, 'title': task.title, 
+                    'status': task.status, 'priority': task.priority}
         }), 201
 
     except ValueError as e:
@@ -195,13 +209,22 @@ def update_task(task_id: int) -> tuple:
                 'error': 'Request body is empty'
             }), 400
 
-        task = manager.update_task(task_id, **data)
-
+        # Find task in all lists and update it
+        for task_list in manager.get_lists():
+            task = manager.get_task(task_list.id, task_id)
+            if task:
+                manager.update_task(task_list.id, task_id, **data)
+                return jsonify({
+                    'success': True,
+                    'message': 'Task updated successfully',
+                    'data': {'id': task.id, 'title': task.title, 
+                            'status': task.status, 'priority': task.priority}
+                }), 200
+        
         return jsonify({
-            'success': True,
-            'message': 'Task updated successfully',
-            'data': task.to_dict()
-        }), 200
+            'success': False,
+            'error': f'Task {task_id} not found'
+        }), 404
 
     except KeyError as e:
         return jsonify({
@@ -233,12 +256,20 @@ def delete_task(task_id: int) -> tuple:
         tuple: JSON response with success message and HTTP status 200.
     """
     try:
-        manager.delete_task(task_id)
-
+        # Find and delete task from all lists
+        for task_list in manager.get_lists():
+            task = manager.get_task(task_list.id, task_id)
+            if task:
+                manager.delete_task(task_list.id, task_id)
+                return jsonify({
+                    'success': True,
+                    'message': f'Task {task_id} deleted successfully'
+                }), 200
+        
         return jsonify({
-            'success': True,
-            'message': f'Task {task_id} deleted successfully'
-        }), 200
+            'success': False,
+            'error': f'Task {task_id} not found'
+        }), 404
 
     except KeyError as e:
         return jsonify({
@@ -327,8 +358,9 @@ def get_all_lists() -> tuple:
         tuple: JSON response with list of all lists and HTTP status code.
     """
     try:
-        lists = manager.get_all_lists()
-        lists_data = [task_list.to_dict() for task_list in lists]
+        lists = manager.get_lists()
+        lists_data = [{'id': tl.id, 'name': tl.name, 'description': tl.description} 
+                     for tl in lists]
 
         return jsonify({
             'success': True,
@@ -364,7 +396,8 @@ def get_list(list_id: int) -> tuple:
 
         return jsonify({
             'success': True,
-            'data': task_list.to_dict()
+            'data': {'id': task_list.id, 'name': task_list.name,
+                    'description': task_list.description}
         }), 200
 
     except KeyError as e:
@@ -416,7 +449,8 @@ def create_list() -> tuple:
         return jsonify({
             'success': True,
             'message': 'List created successfully',
-            'data': task_list.to_dict()
+            'data': {'id': task_list.id, 'name': task_list.name,
+                    'description': task_list.description}
         }), 201
 
     except ValueError as e:
@@ -457,12 +491,27 @@ def update_list(list_id: int) -> tuple:
                 'error': 'Request body is empty'
             }), 400
 
-        task_list = manager.update_list(list_id, **data)
+        task_list = manager.get_list(list_id)
+        if not task_list:
+            return jsonify({
+                'success': False,
+                'error': f'List {list_id} not found'
+            }), 404
 
+        # Update using rename_list for name
+        if 'name' in data:
+            manager.rename_list(list_id, data['name'])
+        
+        # Update description if provided (check if method exists)
+        if 'description' in data and hasattr(task_list, 'description'):
+            task_list.description = data['description']
+
+        task_list = manager.get_list(list_id)
         return jsonify({
             'success': True,
             'message': 'List updated successfully',
-            'data': task_list.to_dict()
+            'data': {'id': task_list.id, 'name': task_list.name,
+                    'description': task_list.description}
         }), 200
 
     except KeyError as e:
